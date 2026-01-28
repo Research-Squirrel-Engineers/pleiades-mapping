@@ -1546,59 +1546,15 @@ def write_outputs(
             log(f"WARN: Could not create manual-eval plots: {e}")
 
     # Basic plots (JPG 300 DPI)
+    # NOTE: We intentionally keep the plot set minimal (paper-friendly):
+    # only the Top-1 contribution-vs-final scatter plots + the Top-1 score stack.
     try:
         import matplotlib.pyplot as plt
 
-        # Histogram of final score
-        fig = plt.figure()
-        ax = fig.add_subplot(111)
-        ax.hist(df["final_score"].astype(float).to_numpy(), bins=30)
-        ax.set_xlabel("final_score")
-        ax.set_ylabel("count")
-        ax.set_title("STL-PA: distribution of final scores")
-        fig_path = out_dir / f"{prefix}_final_score_hist.jpg"
-        fig.savefig(fig_path, dpi=300, bbox_inches="tight")
-        plt.close(fig)
-        log(f"Wrote plot: {fig_path}")
-
-        # Confidence counts
-        fig = plt.figure()
-        ax = fig.add_subplot(111)
-        counts = df["confidence"].value_counts().sort_index()
-        ax.bar(counts.index.astype(str), counts.values)
-        ax.set_xlabel("confidence")
-        ax.set_ylabel("count")
-        ax.set_title("STL-PA: confidence class counts")
-        fig_path = out_dir / f"{prefix}_confidence_counts.jpg"
-        fig.savefig(fig_path, dpi=300, bbox_inches="tight")
-        plt.close(fig)
-        log(f"Wrote plot: {fig_path}")
-
-        # -------------------------------------------------------------
-        # Extra diagnostic plots for Top-1 matches (JPG 300 DPI)
-        # -------------------------------------------------------------
         top1_sorted = top1.sort_values("final_score", ascending=False).copy()
 
-        # Histogram: Top-1 final scores
-        fig = plt.figure()
-        ax = fig.add_subplot(111)
-        ax.hist(top1_sorted["final_score"].astype(float).to_numpy(), bins=20)
-        ax.set_xlabel("final_score")
-        ax.set_ylabel("count")
-        ax.set_title("STL-PA Top-1: distribution of final scores")
-        fig.savefig(fig_path, dpi=300, bbox_inches="tight")
-        plt.close(fig)
-        log(f"Wrote plot: {fig_path}")
-
-        # Scatter: component contribution vs final_score (Top-1)
-        for col in [
-            "geo_contrib",
-            "string_contrib",
-            "time_contrib",
-            "geo_rel",
-            "string_rel",
-            "time_rel",
-        ]:
+        # Scatter: contribution vs final_score (Top-1)
+        for col in ["geo_contrib", "string_contrib", "time_contrib"]:
             if col not in top1_sorted.columns:
                 continue
             fig = plt.figure()
@@ -1842,12 +1798,6 @@ def write_outputs(
     <div class="card">
       <h2>Plots</h2>
       <p class="small muted">Files are referenced relatively (same output folder).</p>
-      <h3>Final score distribution</h3>
-      <img src="{prefix}_final_score_hist.jpg" alt="Histogram of final scores"/>
-      <h3>Confidence class counts</h3>
-      <img src="{prefix}_confidence_counts.jpg" alt="Confidence class counts"/>
-      <h3>Top-1 final score distribution</h3>
-      <img src="{prefix}_top1_final_score_hist.jpg" alt="Histogram of Top-1 final scores"/>
       <h3>Top-1: geo contribution vs final score</h3>
       <img src="{prefix}_top1_geo_contrib_vs_final.jpg" alt="Scatter of geo contribution vs final score (top-1)"/>
       <h3>Top-1: string contribution vs final score</h3>
