@@ -620,7 +620,9 @@ def time_score(
     overlap = interval_overlap(s0, s1, p_start, p_end)
     span_s = max(1, s1 - s0)
     span_p = max(1, p_end - p_start)
-    denom = max(span_s, span_p)
+    # Option A (containment-based): measure how well the Samian interval is covered by the Pleiades interval.
+    # This avoids penalising broad/unspecific Pleiades dating (e.g., -30..300) when it fully contains a narrower Samian range.
+    denom = span_s
     base = overlap / denom if denom > 0 else 0.0
 
     q = q_interval if q_interval is not None else 1.0
