@@ -39,6 +39,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+import numpy as np
 
 import pandas as pd
 
@@ -88,6 +89,126 @@ def normalize_pleiades_id(v: object) -> str:
     # Keep digits only
     digits = "".join(ch for ch in s if ch.isdigit())
     return digits
+
+
+def normalize_numeric_id(val: object) -> str:
+    """Normalise numeric-ish IDs from CSV (e.g., 61, 61.0, '61 ', '061')."""
+    if val is None:
+        return ""
+    s = str(val).strip().strip('"').strip("'")
+    if not s:
+        return ""
+    if re.match(r"^\d+\.0$", s):
+        s = s.split(".", 1)[0]
+    digits = re.findall(r"\d+", s)
+    if not digits:
+        return s.strip()
+    return "".join(digits).lstrip("0") or "0"
+
+
+def html_escape(s: str) -> str:
+    return (
+        str(s)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
+
+
+def write_summary_table_html(summary_json_path: Path, out_html_path: Path) -> None:
+    """Create a standalone HTML view that renders stlpa_summary.json as per-site tables."""
+    try:
+        with open(summary_json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        log(f"WARN: Could not read summary JSON for HTML table: {e}")
+        return
+
+    generated_at = data.get("generated_at", "")
+    params = data.get("params", {})
+    sites = data.get("samian_sites", {}) or {}
+
+    parts: List[str] = []
+    parts.append("<!doctype html><html><head><meta charset='utf-8'/>")
+    parts.append(
+        "<meta name='viewport' content='width=device-width, initial-scale=1'/>"
+    )
+    parts.append("<title>STL-PA Summary (per site)</title>")
+    parts.append(
+        """<style>
+        body{font-family:system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin:24px; line-height:1.35;}
+        h1,h2{margin:0.4em 0;}
+        .muted{color:#666}
+        pre{background:#f6f8fa; padding:12px; border-radius:10px; overflow:auto;}
+        table{border-collapse:collapse; width:100%; margin:10px 0 22px 0; font-size:13px;}
+        th,td{border:1px solid #ddd; padding:6px 8px; vertical-align:top;}
+        th{background:#f3f3f3; text-align:left;}
+        .site{border:1px solid #ddd; border-radius:12px; padding:14px 14px 6px 14px; margin:14px 0;}
+        details summary{cursor:pointer; font-weight:600;}
+        .badge{display:inline-block; padding:2px 8px; border-radius:999px; background:#eef; font-size:12px; margin-left:6px;}
+        .right{text-align:right;}
+        </style>"""
+    )
+    parts.append("</head><body>")
+    parts.append("<h1>STL-PA Summary (per site)</h1>")
+    parts.append(f"<div class='muted'>Generated at: {html_escape(generated_at)}</div>")
+    parts.append("<h2>Parameters</h2>")
+    parts.append(
+        "<pre>"
+        + html_escape(json.dumps(params, indent=2, ensure_ascii=False))
+        + "</pre>"
+    )
+    parts.append(f"<h2>Sites ({len(sites):,})</h2>")
+
+    cols = [
+        ("rank", "right"),
+        ("pleiades_id", ""),
+        ("pleiades_label", ""),
+        ("final_score", "right"),
+        ("geo_score", "right"),
+        ("string_score", "right"),
+        ("time_score", "right"),
+        ("distance_km", "right"),
+        ("confidence", ""),
+    ]
+
+    for sid, sdata in sites.items():
+        label = (sdata.get("samian_label") or "").strip()
+        cands = sdata.get("top_candidates", []) or []
+        top = cands[0] if cands else None
+        top_score = f"{top.get('final_score', 0.0):.3f}" if top else "n/a"
+        top_pid = top.get("pleiades_id", "") if top else ""
+        top_plabel = top.get("pleiades_label", "") if top else ""
+        parts.append("<div class='site'>")
+        parts.append(
+            f"<details><summary>{html_escape(str(sid))} – {html_escape(label)}"
+            f" <span class='badge'>Top: {html_escape(str(top_pid))} ({html_escape(str(top_plabel))}) score={html_escape(top_score)}</span>"
+            f"</summary>"
+        )
+        parts.append("<table><thead><tr>")
+        for c, cls in cols:
+            parts.append(f"<th class='{cls}'>{html_escape(c)}</th>")
+        parts.append("</tr></thead><tbody>")
+        for c in cands:
+            parts.append("<tr>")
+            for col, cls in cols:
+                v = c.get(col, "")
+                if isinstance(v, float):
+                    if col == "distance_km":
+                        cell = f"{v:.2f}"
+                    else:
+                        cell = f"{v:.3f}"
+                else:
+                    cell = str(v)
+                parts.append(f"<td class='{cls}'>{html_escape(cell)}</td>")
+            parts.append("</tr>")
+        parts.append("</tbody></table></details></div>")
+    parts.append("</body></html>")
+
+    out_html_path.write_text("".join(parts), encoding="utf-8")
+    log(f"Wrote summary-table HTML: {out_html_path}")
 
 
 # ---------------------------------------------------------------------
@@ -471,7 +592,7 @@ def load_samian_csv(path: Path) -> pd.DataFrame:
         )
 
     out = df.copy()
-    out["samian_id"] = out["id"].astype(str).str.strip()
+    out["samian_id"] = out["id"].apply(normalize_numeric_id)
     out["label"] = out["label"].astype(str).str.strip()
     out["alt_labels"] = out["altlabels"].astype(str).fillna("").str.strip()
 
@@ -535,7 +656,7 @@ def load_samian_manual_mapping(path: Path) -> pd.DataFrame:
             f"Manual mapping CSV missing columns: {missing}. Found: {list(df.columns)}"
         )
     out = df.copy()
-    out["samian_id"] = out["id"].astype(str).str.strip()
+    out["samian_id"] = out["id"].apply(normalize_numeric_id)
     out["samian_label"] = out["label"].astype(str).str.strip()
     out["manual_pleiades_id"] = out["pleiades"].apply(normalize_pleiades_id)
     out.loc[out["manual_pleiades_id"].apply(_is_nullish), "manual_pleiades_id"] = ""
@@ -1429,7 +1550,7 @@ def write_outputs(
         ax.set_xlabel("final_score")
         ax.set_ylabel("count")
         ax.set_title("STL-PA: distribution of final scores")
-        fig_path = out_dir / f"{prefix}_final_score_hist.jpg"
+        fig_path = out_dir / ""
         fig.savefig(fig_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
         log(f"Wrote plot: {fig_path}")
@@ -1442,7 +1563,7 @@ def write_outputs(
         ax.set_xlabel("confidence")
         ax.set_ylabel("count")
         ax.set_title("STL-PA: confidence class counts")
-        fig_path = out_dir / f"{prefix}_confidence_counts.jpg"
+        fig_path = out_dir / ""
         fig.savefig(fig_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
         log(f"Wrote plot: {fig_path}")
@@ -1459,7 +1580,6 @@ def write_outputs(
         ax.set_xlabel("final_score")
         ax.set_ylabel("count")
         ax.set_title("STL-PA Top-1: distribution of final scores")
-        fig_path = out_dir / f"{prefix}_top1_final_score_hist.jpg"
         fig.savefig(fig_path, dpi=300, bbox_inches="tight")
         plt.close(fig)
         log(f"Wrote plot: {fig_path}")
@@ -1717,11 +1837,8 @@ def write_outputs(
       <h2>Plots</h2>
       <p class="small muted">Files are referenced relatively (same output folder).</p>
       <h3>Final score distribution</h3>
-      <img src="{prefix}_final_score_hist.jpg" alt="Histogram of STL-PA final scores"/>
       <h3>Confidence class counts</h3>
-      <img src="{prefix}_confidence_counts.jpg" alt="Bar chart of confidence class counts"/>
       <h3>Top-1 final score distribution</h3>
-      <img src="{prefix}_top1_final_score_hist.jpg" alt="Histogram of STL-PA top-1 final scores"/>
       <h3>Top-1: geo contribution vs final score</h3>
       <img src="{prefix}_top1_geo_contrib_vs_final.jpg" alt="Scatter of geo contribution vs final score (top-1)"/>
       <h3>Top-1: string contribution vs final score</h3>
