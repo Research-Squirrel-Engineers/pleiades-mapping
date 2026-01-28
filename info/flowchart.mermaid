@@ -1,0 +1,24 @@
+flowchart TD
+  A["Input CSVs in ./src<br/>SamianResearch + Pleiades"] --> B["Normalise & Build Views<br/>samian_df<br/>pleiades_view_df"]
+  B --> C["Vectorised spatial distance<br/>Haversine over all Pleiades"]
+  C --> D{"For each Samian site"}
+  D --> E["Candidate generation<br/>base_radius_km<br/>+ adaptive_radius (unc_interval)<br/>Top-K fallback"]
+  E --> F{"For each candidate"}
+  F --> G["Geo score<br/>d = haversine<br/>acc_km = max_accuracy_m / 1000<br/>d_eff = max(0, d - acc_km)<br/>geo = exp(-d_eff / sigma)<br/>rough → penalty"]
+  F --> H["String score<br/>Best match over<br/>label + alt_labels<br/>(penalised alt–alt)"]
+  F --> I["Time score<br/>Interval overlap<br/>± uncertainty<br/>weighted by q_interval"]
+  G --> J["Fusion & weighting<br/>Dynamic weights (optional)<br/>final = w_geo·geo + w_str·str + w_time·time"]
+  H --> J
+  I --> J
+  J --> K["Rank candidates per Samian site"]
+  K --> L["Assign confidence<br/>high / medium / low"]
+  L --> M["Outputs"]
+  M --> M1["stlpa_candidates_scored.csv"]
+  M --> M2["stlpa_top1.csv"]
+  M --> M3["stlpa_summary.json"]
+  M --> M4["stlpa_summary.html"]
+  M --> M5["stlpa_report.html"]
+  L --> N{"Manual mapping available?"}
+  N -->|yes| O["Augment missing manual pairs<br/>Re-rank & evaluate"]
+  O --> O1["stlpa_manual_eval.csv"]
+  O --> O2["stlpa_manual_eval_summary.json"]
