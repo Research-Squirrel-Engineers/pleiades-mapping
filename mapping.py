@@ -56,7 +56,15 @@ FILES = {
     "places_accuracy": SRC_DIR / "places_accuracy.csv",
     "time_periods": SRC_DIR / "time_periods.csv",
     "samian": SRC_DIR / "samianresearch.csv",
+    # Optional: manual mapping from SamianResearch → Pleiades (ground truth / legacy links)
+    # Expected columns: id,label,pleiades  (pleiades may be empty/NULL)
+    "samian_manual": SRC_DIR / "samianresearch_pleiades.csv",
 }
+
+
+def _is_nullish(v: object) -> bool:
+    s = str(v).strip().lower()
+    return s in {"", "null", "none", "nan", "na"}
 
 
 # ---------------------------------------------------------------------
@@ -490,6 +498,27 @@ def load_samian_csv(path: Path) -> pd.DataFrame:
     ].copy()
 
 
+def load_samian_manual_mapping(path: Path) -> pd.DataFrame:
+    """Load optional manual Samian→Pleiades links.
+
+    Expected columns: id,label,pleiades
+    - pleiades may be empty/NULL.
+    """
+    df = read_csv(path)
+    required = {"id", "label", "pleiades"}
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Manual mapping CSV missing columns: {missing}. Found: {list(df.columns)}"
+        )
+    out = df.copy()
+    out["samian_id"] = out["id"].astype(str).str.strip()
+    out["samian_label"] = out["label"].astype(str).str.strip()
+    out["manual_pleiades_id"] = out["pleiades"].astype(str).str.strip()
+    out.loc[out["manual_pleiades_id"].apply(_is_nullish), "manual_pleiades_id"] = ""
+    return out[["samian_id", "samian_label", "manual_pleiades_id"]].copy()
+
+
 # ---------------------------------------------------------------------
 # STL-PA scoring utilities
 # ---------------------------------------------------------------------
@@ -888,7 +917,11 @@ def run_stlpa(
 # Outputs
 # ---------------------------------------------------------------------
 def write_outputs(
-    df: pd.DataFrame, out_dir: Path, params: STLPAParams, prefix: str = "stlpa"
+    df: pd.DataFrame,
+    out_dir: Path,
+    params: STLPAParams,
+    prefix: str = "stlpa",
+    manual_map_df: Optional[pd.DataFrame] = None,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -945,6 +978,201 @@ def write_outputs(
     top1_path = out_dir / f"{prefix}_top1.csv"
     top1.to_csv(top1_path, index=False, encoding="utf-8")
     log(f"Wrote top-1 CSV: {top1_path}")
+
+    # -----------------------------------------------------------------
+    # Optional evaluation against manual Samian→Pleiades links
+    # -----------------------------------------------------------------
+    eval_df: Optional[pd.DataFrame] = None
+    eval_summary: Dict[str, object] = {}
+    if manual_map_df is not None and not manual_map_df.empty:
+        # Join manual ids to predicted top-1
+        mm = manual_map_df.copy()
+        mm["samian_id"] = mm["samian_id"].astype(str).str.strip()
+        mm["manual_pleiades_id"] = mm["manual_pleiades_id"].astype(str).str.strip()
+
+        pred = top1.copy()
+        pred["samian_id"] = pred["samian_id"].astype(str).str.strip()
+
+        eval_df = mm.merge(
+            pred,
+            on="samian_id",
+            how="left",
+            suffixes=("_manual", "_pred"),
+        )
+
+        # Normalise a human-readable label column for reporting (prefer manual label if present)
+        if "samian_label_manual" in eval_df.columns:
+            eval_df["label"] = eval_df["samian_label_manual"].astype(str).str.strip()
+        elif "samian_label" in eval_df.columns:
+            eval_df["label"] = eval_df["samian_label"].astype(str).str.strip()
+        elif "samian_label_pred" in eval_df.columns:
+            eval_df["label"] = eval_df["samian_label_pred"].astype(str).str.strip()
+        else:
+            eval_df["label"] = ""
+        eval_df.loc[eval_df["label"].apply(_is_nullish), "label"] = ""
+
+        eval_df["has_manual"] = (
+            eval_df["manual_pleiades_id"].astype(str).str.strip().ne("")
+        )
+        eval_df["has_prediction"] = eval_df["pleiades_id"].notna() & eval_df[
+            "pleiades_id"
+        ].astype(str).str.strip().ne("")
+        eval_df["is_correct"] = (
+            eval_df["has_manual"]
+            & eval_df["has_prediction"]
+            & (
+                eval_df["manual_pleiades_id"].astype(str).str.strip()
+                == eval_df["pleiades_id"].astype(str).str.strip()
+            )
+        )
+
+        # For each manual link, check whether that Pleiades id appears among our candidates (within radius)
+        # and if yes, capture its score/rank/components for comparison.
+        manual_rows = df.merge(
+            mm[["samian_id", "manual_pleiades_id"]],
+            on="samian_id",
+            how="inner",
+        )
+        manual_rows = manual_rows[
+            (manual_rows["manual_pleiades_id"].astype(str).str.strip() != "")
+            & (
+                manual_rows["pleiades_id"].astype(str).str.strip()
+                == manual_rows["manual_pleiades_id"].astype(str).str.strip()
+            )
+        ].copy()
+        manual_rows = manual_rows.sort_values(
+            ["samian_id", "final_score"], ascending=[True, False]
+        )
+        manual_rows = manual_rows.groupby("samian_id").head(1)
+
+        # Left-join so we can see when manual id was not in the candidate set
+        eval_df = eval_df.merge(
+            manual_rows[
+                [
+                    "samian_id",
+                    "final_score",
+                    "geo_score",
+                    "string_score",
+                    "time_score",
+                    "geo_contrib",
+                    "string_contrib",
+                    "time_contrib",
+                    "geo_rel",
+                    "string_rel",
+                    "time_rel",
+                    "distance_km",
+                    "rank",
+                ]
+            ].rename(
+                columns={
+                    "final_score": "manual_final_score",
+                    "geo_score": "manual_geo_score",
+                    "string_score": "manual_string_score",
+                    "time_score": "manual_time_score",
+                    "geo_contrib": "manual_geo_contrib",
+                    "string_contrib": "manual_string_contrib",
+                    "time_contrib": "manual_time_contrib",
+                    "geo_rel": "manual_geo_rel",
+                    "string_rel": "manual_string_rel",
+                    "time_rel": "manual_time_rel",
+                    "distance_km": "manual_distance_km",
+                    "rank": "manual_rank",
+                }
+            ),
+            on="samian_id",
+            how="left",
+        )
+
+        eval_df["manual_in_candidates"] = eval_df["manual_rank"].notna()
+
+        eval_df["status"] = "no_manual"
+        eval_df.loc[eval_df["has_manual"], "status"] = "manual_only"
+        eval_df.loc[
+            eval_df["has_manual"] & eval_df["manual_in_candidates"], "status"
+        ] = "manual_in_candidates"
+        eval_df.loc[eval_df["is_correct"], "status"] = "match"
+        eval_df.loc[eval_df["has_manual"] & ~eval_df["is_correct"], "status"] = (
+            "mismatch"
+        )
+        eval_df.loc[
+            eval_df["has_manual"] & ~eval_df["manual_in_candidates"], "status"
+        ] = "manual_not_in_candidates"
+
+        # Summary metrics
+        n_total = len(eval_df)
+        n_manual = int(eval_df["has_manual"].sum())
+        n_pred = int(eval_df["has_prediction"].sum())
+        n_correct = int(eval_df["is_correct"].sum())
+        n_manual_in_cands = int(eval_df["manual_in_candidates"].sum())
+        acc = (n_correct / n_manual) if n_manual else 0.0
+
+        eval_summary = {
+            "n_total_samian_in_manual_file": n_total,
+            "n_with_manual_pleiades": n_manual,
+            "n_with_prediction": n_pred,
+            "n_correct_top1": n_correct,
+            "accuracy_top1_over_manual": acc,
+            "n_manual_present_in_candidates": n_manual_in_cands,
+            "status_counts": eval_df["status"].value_counts().to_dict(),
+        }
+
+        eval_csv = out_dir / f"{prefix}_manual_eval.csv"
+        eval_df.to_csv(eval_csv, index=False, encoding="utf-8")
+        log(f"Wrote manual eval CSV: {eval_csv}")
+
+        eval_json = out_dir / f"{prefix}_manual_eval_summary.json"
+        eval_json.write_text(
+            json.dumps(eval_summary, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        log(f"Wrote manual eval JSON: {eval_json}")
+
+        # Two lightweight evaluation plots (JPG 300 DPI)
+        try:
+            import matplotlib.pyplot as plt
+
+            # Status counts
+            fig = plt.figure()
+            ax = fig.add_subplot(111)
+            vc = eval_df["status"].value_counts().sort_index()
+            ax.bar(vc.index.astype(str).tolist(), vc.values.tolist())
+            ax.set_title("Manual mapping: status counts")
+            ax.set_xlabel("status")
+            ax.set_ylabel("count")
+            fig.tight_layout()
+            p_status = out_dir / f"{prefix}_manual_status_counts.jpg"
+            fig.savefig(p_status, dpi=300)
+            plt.close(fig)
+
+            # Predicted final score distribution by (match vs mismatch)
+            fig = plt.figure()
+            ax = fig.add_subplot(111)
+            m = eval_df[eval_df["has_manual"]].copy()
+            # Some rows may have NaN scores if no prediction was produced
+            m["pred_final_score"] = pd.to_numeric(m["final_score"], errors="coerce")
+            ax.hist(
+                m.loc[m["status"] == "match", "pred_final_score"].dropna().to_numpy(),
+                bins=20,
+                alpha=0.8,
+                label="match",
+            )
+            ax.hist(
+                m.loc[m["status"] == "mismatch", "pred_final_score"]
+                .dropna()
+                .to_numpy(),
+                bins=20,
+                alpha=0.8,
+                label="mismatch",
+            )
+            ax.set_title("Manual mapping: predicted final_score")
+            ax.set_xlabel("pred_final_score")
+            ax.set_ylabel("count")
+            ax.legend()
+            fig.tight_layout()
+            p_hist = out_dir / f"{prefix}_manual_pred_score_hist.jpg"
+            fig.savefig(p_hist, dpi=300)
+            plt.close(fig)
+        except Exception as e:
+            log(f"WARN: Could not create manual-eval plots: {e}")
 
     # Basic plots (JPG 300 DPI)
     try:
@@ -1090,6 +1318,117 @@ def write_outputs(
                     "</tr>"
                 )
 
+            # Optional: evaluation table (manual vs predicted)
+            eval_block_html = ""
+            if (
+                eval_df is not None
+                and isinstance(eval_df, pd.DataFrame)
+                and not eval_df.empty
+            ):
+                # Keep only rows where a manual id exists (this is the interesting subset)
+                e = eval_df.copy()
+                e["manual_pleiades_id"] = (
+                    e["manual_pleiades_id"].astype(str).str.strip()
+                )
+                e = e[e["has_manual"]].copy() if "has_manual" in e.columns else e
+
+                # Sort: mismatches first (so you spot problems), then by predicted score desc
+                if "status" in e.columns:
+                    status_order = {
+                        "mismatch": 0,
+                        "match": 1,
+                        "manual_not_in_candidates": 2,
+                        "manual_in_candidates": 3,
+                        "manual_only": 4,
+                        "no_manual": 5,
+                    }
+                    e["_status_order"] = e["status"].map(status_order).fillna(9)
+                    e = e.sort_values(
+                        ["_status_order", "final_score"], ascending=[True, False]
+                    )
+                else:
+                    e = e.sort_values("final_score", ascending=False)
+
+                # Build rows
+                eval_rows = []
+                for _, r in e.iterrows():
+                    manual_pid = str(r.get("manual_pleiades_id", "")).strip()
+                    pred_pid = str(r.get("pleiades_id", "")).strip()
+                    pred_uri = str(r.get("pleiades_uri", "")).strip()
+                    status = str(r.get("status", "")).strip()
+
+                    pred_link = (
+                        f"<a href='{esc(pred_uri)}'>{esc(pred_pid)}</a>"
+                        if pred_uri
+                        else esc(pred_pid)
+                    )
+
+                    def fnum(x) -> str:
+                        try:
+                            return f"{float(x):.3f}"
+                        except Exception:
+                            return ""
+
+                    eval_rows.append(
+                        "<tr>"
+                        f"<td>{esc(r.get('samian_id',''))}</td>"
+                        f"<td>{esc(r.get('label',''))}</td>"
+                        f"<td>{esc(manual_pid)}</td>"
+                        f"<td>{pred_link}</td>"
+                        f"<td>{esc(status)}</td>"
+                        f"<td>{fnum(r.get('final_score'))}</td>"
+                        f"<td>{fnum(r.get('geo_score'))}</td>"
+                        f"<td>{fnum(r.get('string_score'))}</td>"
+                        f"<td>{fnum(r.get('time_score'))}</td>"
+                        f"<td>{fnum(r.get('manual_final_score'))}</td>"
+                        f"<td>{fnum(r.get('manual_geo_score'))}</td>"
+                        f"<td>{fnum(r.get('manual_string_score'))}</td>"
+                        f"<td>{fnum(r.get('manual_time_score'))}</td>"
+                        f"<td>{str(r.get('manual_rank','')) if pd.notna(r.get('manual_rank')) else ''}</td>"
+                        "</tr>"
+                    )
+
+                eval_summary_pre = ""
+                if isinstance(eval_summary, dict) and eval_summary:
+                    eval_summary_pre = (
+                        f"<pre>{esc(json.dumps(eval_summary, indent=2))}</pre>"
+                    )
+
+                eval_block_html = f"""
+  <div class=\"card\" style=\"margin-top:18px;\">
+    <h2>Manual Samian→Pleiades links vs STL-PA top-1</h2>
+    <p class=\"small muted\">This section is shown because <code>src/samianresearch_pleiades.csv</code> was found.</p>
+    {eval_summary_pre}
+    <h3>Evaluation plots</h3>
+    <img src=\"{prefix}_manual_status_counts.jpg\" alt=\"Manual mapping status counts\"/>
+    <img src=\"{prefix}_manual_pred_score_hist.jpg\" alt=\"Predicted final_score distribution (match vs mismatch)\"/>
+    <h3>Manual vs predicted (all rows with manual ids)</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>samian_id</th>
+          <th>label</th>
+          <th>manual_pleiades</th>
+          <th>pred_pleiades</th>
+          <th>status</th>
+          <th>pred_final</th>
+          <th>pred_geo</th>
+          <th>pred_string</th>
+          <th>pred_time</th>
+          <th>manual_final</th>
+          <th>manual_geo</th>
+          <th>manual_string</th>
+          <th>manual_time</th>
+          <th>manual_rank</th>
+        </tr>
+      </thead>
+      <tbody>
+        {''.join(eval_rows)}
+      </tbody>
+    </table>
+  </div>
+"""
+
             params_pretty = esc(json.dumps(asdict(params), indent=2))
 
             html = f"""<!doctype html>
@@ -1150,6 +1489,8 @@ def write_outputs(
 
     </div>
   </div>
+
+  {eval_block_html}
 
   <div class="card" style="margin-top:18px;">
     <h2>Top-1 matches (all, sorted by score)</h2>
@@ -1308,9 +1649,12 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    # Validate files exist early
+    # Validate required input files exist early
     for k, pth in FILES.items():
         if k == "time_periods" and not args.with_time_periods:
+            continue
+        if k == "samian_manual":
+            # Optional, used only for evaluation/QA.
             continue
         if not pth.exists():
             raise FileNotFoundError(f"Missing required input file: {pth}")
@@ -1321,6 +1665,14 @@ def main() -> None:
     samian_df = load_samian_csv(FILES["samian"])
 
     log(f"Samian ready: {len(samian_df):,} rows")
+
+    manual_map_df: Optional[pd.DataFrame] = None
+    if FILES["samian_manual"].exists():
+        try:
+            manual_map_df = load_samian_manual_mapping(FILES["samian_manual"])
+            log(f"Manual Samian→Pleiades links: {len(manual_map_df):,} rows")
+        except Exception as e:
+            log(f"Manual mapping file found but could not be read: {e}")
 
     params = STLPAParams(
         radius_km=float(args.radius_km),
@@ -1345,8 +1697,23 @@ def main() -> None:
 
     scored = run_stlpa(pleiades_view_df, samian_df, params)
 
+    # Optional manual mapping for evaluation
+    manual_map_df: Optional[pd.DataFrame] = None
+    if FILES["samian_manual"].exists():
+        try:
+            manual_map_df = load_samian_manual_mapping(FILES["samian_manual"])
+            log(f"Manual mapping ready: {len(manual_map_df):,} rows")
+        except Exception as e:
+            log(f"WARN: Could not load manual mapping CSV: {e}")
+
     out_dir = (BASE_DIR / args.out_dir).resolve()
-    write_outputs(scored, out_dir=out_dir, params=params, prefix=str(args.prefix))
+    write_outputs(
+        scored,
+        out_dir=out_dir,
+        params=params,
+        prefix=str(args.prefix),
+        manual_map_df=manual_map_df,
+    )
 
     log("Done.")
 
