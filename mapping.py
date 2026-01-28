@@ -67,6 +67,29 @@ def _is_nullish(v: object) -> bool:
     return s in {"", "null", "none", "nan", "na"}
 
 
+def normalize_pleiades_id(v: object) -> str:
+    """Normalise a Pleiades numeric id coming from CSV/Excel exports.
+
+    - strips whitespace
+    - treats NULL/None/NaN as empty string
+    - keeps only digits (so '433032.0' -> '433032', 'https://.../places/433032' -> '433032')
+    """
+    if v is None:
+        return ""
+    s = str(v).strip()
+    if _is_nullish(s):
+        return ""
+    # If a full URI is provided, keep last path segment.
+    if "/" in s:
+        s = s.rstrip("/").split("/")[-1]
+    # Remove common float artefacts like "12345.0"
+    if re.fullmatch(r"\d+\.0+", s):
+        s = s.split(".", 1)[0]
+    # Keep digits only
+    digits = "".join(ch for ch in s if ch.isdigit())
+    return digits
+
+
 # ---------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------
@@ -514,7 +537,7 @@ def load_samian_manual_mapping(path: Path) -> pd.DataFrame:
     out = df.copy()
     out["samian_id"] = out["id"].astype(str).str.strip()
     out["samian_label"] = out["label"].astype(str).str.strip()
-    out["manual_pleiades_id"] = out["pleiades"].astype(str).str.strip()
+    out["manual_pleiades_id"] = out["pleiades"].apply(normalize_pleiades_id)
     out.loc[out["manual_pleiades_id"].apply(_is_nullish), "manual_pleiades_id"] = ""
     return out[["samian_id", "samian_label", "manual_pleiades_id"]].copy()
 
@@ -974,6 +997,169 @@ def run_stlpa(
 # ---------------------------------------------------------------------
 # Outputs
 # ---------------------------------------------------------------------
+
+
+def augment_with_manual_pairs(
+    scored: pd.DataFrame,
+    pleiades_view: pd.DataFrame,
+    samian_df: pd.DataFrame,
+    p: STLPAParams,
+    manual_map_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Ensure all manual Samian→Pleiades links are present in candidate list.
+
+    This fixes cases where a correct/manual Pleiades target exists in the dataset
+    but was excluded by radius/top-k candidate pruning.
+    """
+    if scored.empty or manual_map_df is None or manual_map_df.empty:
+        return scored
+
+    # Lookups
+    ple = pleiades_view.copy()
+    ple["pleiades_id"] = ple["pleiades_id"].apply(normalize_pleiades_id)
+    ple_idx = ple.set_index("pleiades_id", drop=False)
+
+    sam = samian_df.copy()
+    sam["samian_id"] = sam["samian_id"].astype(str).str.strip()
+    sam_idx = sam.set_index("samian_id", drop=False)
+
+    existing = set(
+        zip(scored["samian_id"].astype(str), scored["pleiades_id"].astype(str))
+    )
+
+    add_rows: List[Dict[str, object]] = []
+    for _, r in manual_map_df.iterrows():
+        s_id = str(r["samian_id"]).strip()
+        p_id = normalize_pleiades_id(r.get("manual_pleiades_id", ""))
+        if not s_id or not p_id:
+            continue
+        if (s_id, p_id) in existing:
+            continue
+        if s_id not in sam_idx.index or p_id not in ple_idx.index:
+            # If the IDs cannot be resolved, skip (but keep evaluation status later)
+            continue
+
+        srow = sam_idx.loc[s_id]
+        prow = ple_idx.loc[p_id]
+
+        # Build scores exactly like in run_stlpa (single pair)
+        if not bool(srow.get("has_coords", True)):
+            continue
+
+        s_lat = float(srow["latitude"])
+        s_lon = float(srow["longitude"])
+        p_lat = float(prow["latitude"])
+        p_lon = float(prow["longitude"])
+
+        d_km = float(
+            haversine_km(s_lat, s_lon, np.array([p_lat]), np.array([p_lon]))[0]
+        )
+
+        acc_m = float(prow.get("max_accuracy_meters", 0.0) or 0.0)
+        acc_km = acc_m / 1000.0
+        d_eff = max(0.0, d_km - acc_km)
+
+        geo = math.exp(-d_eff / float(p.sigma_km))
+        if str(prow.get("location_precision", "")).strip().lower() == "rough":
+            geo *= float(p.rough_penalty)
+
+        str_sc, str_mode = best_string_score(
+            str(srow["label"]),
+            str(srow["alt_labels"]),
+            str(prow["label"]),
+            str(prow["alt_labels"]),
+        )
+
+        t_sc = time_score(
+            srow["earliest_year"],
+            srow["latest_year"],
+            srow.get("unc_start_years"),
+            srow.get("unc_end_years"),
+            srow.get("q_interval"),
+            prow.get("earliest_year"),
+            prow.get("latest_year"),
+        )
+
+        w_geo_l, w_str_l, w_time_l = dynamic_fusion_weights(
+            float(p.w_geo), float(p.w_str), float(p.w_time), acc_km, p
+        )
+
+        geo_factor = geo * min(1.0, float(str_sc) + 0.2)
+        geo_contrib = w_geo_l * geo_factor
+        str_contrib = w_str_l * float(str_sc)
+        time_contrib = w_time_l * float(t_sc)
+        final = float(geo_contrib + str_contrib + time_contrib)
+
+        add_rows.append(
+            {
+                "samian_id": s_id,
+                "samian_label": str(srow["label"]),
+                "samian_alt_labels": str(srow["alt_labels"]),
+                "samian_lat": s_lat,
+                "samian_lon": s_lon,
+                "samian_earliest_year": srow["earliest_year"],
+                "samian_latest_year": srow["latest_year"],
+                "samian_q_start": srow.get("q_start"),
+                "samian_q_end": srow.get("q_end"),
+                "samian_q_interval": srow.get("q_interval"),
+                "samian_unc_start_years": srow.get("unc_start_years"),
+                "samian_unc_end_years": srow.get("unc_end_years"),
+                "samian_unc_interval_years": srow.get("unc_interval_years"),
+                "pleiades_id": p_id,
+                "pleiades_label": str(prow["label"]),
+                "pleiades_alt_labels": str(prow["alt_labels"]),
+                "pleiades_lat": p_lat,
+                "pleiades_lon": p_lon,
+                "pleiades_earliest_year": prow.get("earliest_year"),
+                "pleiades_latest_year": prow.get("latest_year"),
+                "pleiades_location_precision": prow.get("location_precision"),
+                "pleiades_max_accuracy_meters": prow.get("max_accuracy_meters"),
+                "distance_km": d_km,
+                "distance_eff_km": d_eff,
+                "geo_score": float(geo),
+                "geo_factor": float(geo_factor),
+                "string_score": float(str_sc),
+                "string_mode": str(str_mode),
+                "time_score": float(t_sc),
+                "w_geo": float(w_geo_l),
+                "w_str": float(w_str_l),
+                "w_time": float(w_time_l),
+                "geo_contrib": float(geo_contrib),
+                "string_contrib": float(str_contrib),
+                "time_contrib": float(time_contrib),
+                "final_score": final,
+                "geo_rel": float(geo_contrib / final) if final > 0 else 0.0,
+                "string_rel": float(str_contrib / final) if final > 0 else 0.0,
+                "time_rel": float(time_contrib / final) if final > 0 else 0.0,
+                # rank/confidence will be recomputed below
+                "rank": -1,
+                "confidence": "",
+            }
+        )
+
+    if not add_rows:
+        return scored
+
+    augmented = pd.concat([scored, pd.DataFrame(add_rows)], ignore_index=True)
+
+    # Recompute rank + confidence per samian_id
+    augmented["samian_id"] = augmented["samian_id"].astype(str)
+    augmented = augmented.sort_values(
+        ["samian_id", "final_score"], ascending=[True, False]
+    )
+
+    augmented["rank"] = (
+        augmented.groupby("samian_id")["final_score"]
+        .rank(method="first", ascending=False)
+        .astype(int)
+    )
+    augmented["confidence"] = augmented["final_score"].apply(
+        lambda x: confidence_label(float(x), p)
+    )
+
+    return augmented
+
+
 def write_outputs(
     df: pd.DataFrame,
     out_dir: Path,
@@ -1763,6 +1949,16 @@ def main() -> None:
             log(f"Manual mapping ready: {len(manual_map_df):,} rows")
         except Exception as e:
             log(f"WARN: Could not load manual mapping CSV: {e}")
+
+    # Ensure manual Pleiades targets are present in the scored candidate list
+    if manual_map_df is not None and not manual_map_df.empty:
+        scored = augment_with_manual_pairs(
+            scored=scored,
+            pleiades_view=pleiades_view_df,
+            samian_df=samian_df,
+            p=params,
+            manual_map_df=manual_map_df,
+        )
 
     out_dir = (BASE_DIR / args.out_dir).resolve()
     write_outputs(
