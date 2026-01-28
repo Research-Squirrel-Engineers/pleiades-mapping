@@ -4,16 +4,19 @@ INPUT
                 S_start, S_end,
                 q_interval,
                 unc_start, unc_end, unc_interval
+
   Pleiades places P = {p1..pm}
     each p has: place_id, title, alt_labels, lat, lon,
                 P_start, P_end,
                 location_precision,
-                max_accuracy_m
+                max_accuracy_m   (from places_accuracy.csv; 0 if missing)
 
 PARAMETERS
   base_radius_km
   sigma_km
-  weights (w_geo, w_str, w_time) with sum = 1
+  rough_penalty_factor              # e.g. 0.6 (applied if location_precision == "rough")
+  weights (w_geo, w_str, w_time)    # normalised to sum = 1
+  dynamic_weighting (optional)      # can reduce geo weight for large max_accuracy_m
   top_k_candidates (optional)
   thresholds: high_conf, medium_conf
 
@@ -23,8 +26,16 @@ FUNCTIONS
   clamp(x, lo, hi) -> x'
   interval_overlap(a_start, a_end, b_start, b_end) -> years
   interval_span(start, end) -> years
+  normalise_weights(w_geo, w_str, w_time) -> (w_geo, w_str, w_time)
 
 ALGORITHM
+
+0) Build normalised views (preprocessing)
+   - Build a Pleiades "view" by joining:
+       places.csv + (aggregated names.csv as alt_labels) + (aggregated location_points.csv as era)
+       + places_accuracy.csv as max_accuracy_m
+   - Build Samian view from samianresearch.csv
+   - Optional: load manual mapping samianresearch_pleiades.csv (ground truth / legacy links)
 
 1) Build spatial index over P using coordinates (lat, lon)
 
@@ -35,9 +46,8 @@ ALGORITHM
            continue (cannot spatially match)
 
        adaptive_radius_km = base_radius_km + 0.5 * s.unc_interval
-       query_radius_km = adaptive_radius_km + max_Pleiades_accuracy_buffer
-         (implementation: first retrieve top_k nearest, then filter by radius;
-          or retrieve within radius directly)
+       query_radius_km    = adaptive_radius_km + max_Pleiades_accuracy_buffer
+         (implementation: retrieve within radius; or retrieve top_k nearest, then filter by radius)
 
        C = spatial_candidates(P, s, query_radius_km, top_k_candidates)
 
@@ -47,15 +57,19 @@ ALGORITHM
        d_km = haversine_km(s.lat, s.lon, p.lat, p.lon)
 
        acc_km = (p.max_accuracy_m or 0) / 1000
-       d_eff = max(0, d_km - acc_km)
+       d_eff  = max(0, d_km - acc_km)
 
        geo_score = exp( - d_eff / sigma_km )
 
        if p.location_precision == "rough":
-           geo_score = geo_score * rough_penalty_factor   # e.g. 0.6
+           geo_score = geo_score * rough_penalty_factor
+
+       # optional: dynamic weighting if p.max_accuracy_m is large
+       # (example idea: reduce w_geo down to a floor, redistribute to w_str/w_time)
+       # (actual formula is implementation-specific)
 
        # --- STRING ---
-       samian_names = {s.label} ∪ split_pipe(s.alt_labels)
+       samian_names   = {s.label} ∪ split_pipe(s.alt_labels)
        pleiades_names = {p.title} ∪ split_pipe(p.alt_labels)
 
        string_score = max_{a in samian_names, b in pleiades_names} string_similarity(a, b)
@@ -81,10 +95,11 @@ ALGORITHM
            time_score = 0
 
        # --- FUSION ---
+       # weights are normalised to sum to 1.0
        final_score = w_geo*geo_score + w_str*string_score + w_time*time_score
 
-       record alignment row:
-         (s.id, p.place_id, d_km, geo_score, string_score, time_score, final_score)
+       record candidate row:
+         (s.id, p.place_id, d_km, geo_score, string_score, time_score, final_score, ...)
 
    2.3 Rank candidates for s by final_score desc
        assign confidence label:
@@ -92,6 +107,30 @@ ALGORITHM
          elif final_score >= medium_conf: "medium"
          else: "low"
 
-OUTPUT
-  alignment_candidates_scored.csv with per-(s,p) scores and ranks
-  optional: top_match_per_samian.csv
+3) Optional: augment with manual pairs (evaluation / QA)
+   If a manual mapping file exists:
+     - Ensure each (samian_id, manual_pleiades_id) appears in the scored table even if the target was
+       outside the radius/top-k candidate set.
+     - Mark status per manual row, e.g.:
+         "match"                   manual id equals predicted top-1
+         "mismatch"                manual id differs from predicted top-1
+         "manual_not_in_candidates" manual id was added because it was missing from candidates
+         "manual_missing"          no manual pleiades id provided
+
+OUTPUTS (default prefix: stlpa, folder: ./out)
+  stlpa_candidates_scored.csv
+  stlpa_summary.json                 (per Samian site: top candidates + parameters)
+  stlpa_summary.html                 (HTML rendering of stlpa_summary.json; per-site tables)
+
+  stlpa_top1.csv                     (top-1 per Samian site)
+
+  stlpa_report.html                  (compact report)
+    - plots section only keeps:
+        Top-1: geo contribution vs final score
+        Top-1: string contribution vs final score
+        Top-1: time contribution vs final score
+        Top-1 score stack
+
+  If manual mapping exists additionally:
+    stlpa_manual_eval.csv
+    stlpa_manual_eval_summary.json
