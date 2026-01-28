@@ -1,0 +1,97 @@
+INPUT
+  Samian sites S = {s1..sn}
+    each s has: id, label, alt_labels, lat, lon,
+                S_start, S_end,
+                q_interval,
+                unc_start, unc_end, unc_interval
+  Pleiades places P = {p1..pm}
+    each p has: place_id, title, alt_labels, lat, lon,
+                P_start, P_end,
+                location_precision,
+                max_accuracy_m
+
+PARAMETERS
+  base_radius_km
+  sigma_km
+  weights (w_geo, w_str, w_time) with sum = 1
+  top_k_candidates (optional)
+  thresholds: high_conf, medium_conf
+
+FUNCTIONS
+  haversine_km(lat1, lon1, lat2, lon2) -> d_km
+  string_similarity(a, b) -> [0,1]
+  clamp(x, lo, hi) -> x'
+  interval_overlap(a_start, a_end, b_start, b_end) -> years
+  interval_span(start, end) -> years
+
+ALGORITHM
+
+1) Build spatial index over P using coordinates (lat, lon)
+
+2) FOR each samian site s in S:
+
+   2.1 Candidate Generation (spatial)
+       if s.lat or s.lon missing:
+           continue (cannot spatially match)
+
+       adaptive_radius_km = base_radius_km + 0.5 * s.unc_interval
+       query_radius_km = adaptive_radius_km + max_Pleiades_accuracy_buffer
+         (implementation: first retrieve top_k nearest, then filter by radius;
+          or retrieve within radius directly)
+
+       C = spatial_candidates(P, s, query_radius_km, top_k_candidates)
+
+   2.2 FOR each candidate p in C:
+
+       # --- GEO ---
+       d_km = haversine_km(s.lat, s.lon, p.lat, p.lon)
+
+       acc_km = (p.max_accuracy_m or 0) / 1000
+       d_eff = max(0, d_km - acc_km)
+
+       geo_score = exp( - d_eff / sigma_km )
+
+       if p.location_precision == "rough":
+           geo_score = geo_score * rough_penalty_factor   # e.g. 0.6
+
+       # --- STRING ---
+       samian_names = {s.label} ∪ split_pipe(s.alt_labels)
+       pleiades_names = {p.title} ∪ split_pipe(p.alt_labels)
+
+       string_score = max_{a in samian_names, b in pleiades_names} string_similarity(a, b)
+
+       # --- TIME ---
+       if s.S_start, s.S_end exist:
+           S_start' = s.S_start - s.unc_start
+           S_end'   = s.S_end   + s.unc_end
+       else:
+           S_start', S_end' = None
+
+       if p.P_start, p.P_end exist:
+           P_start', P_end' = p.P_start, p.P_end
+       else:
+           P_start', P_end' = None
+
+       if both intervals exist:
+           overlap = interval_overlap(S_start', S_end', P_start', P_end')
+           denom   = max(interval_span(S_start', S_end'), interval_span(P_start', P_end'))
+           time_score = (overlap / denom) if denom > 0 else 0
+           time_score = time_score * s.q_interval
+       else:
+           time_score = 0
+
+       # --- FUSION ---
+       final_score = w_geo*geo_score + w_str*string_score + w_time*time_score
+
+       record alignment row:
+         (s.id, p.place_id, d_km, geo_score, string_score, time_score, final_score)
+
+   2.3 Rank candidates for s by final_score desc
+       assign confidence label:
+         if final_score >= high_conf: "high"
+         elif final_score >= medium_conf: "medium"
+         else: "low"
+
+OUTPUT
+  alignment_candidates_scored.csv with per-(s,p) scores and ranks
+  optional: top_match_per_samian.csv
