@@ -4,17 +4,21 @@
 
 ## Introduction
 
-**samianresearch-stlpa** implements *STL‑PA* (Spatio‑Temporal‑Lexical Place Alignment), a semi‑automatic method for aligning archaeological site references from the *SamianResearch* dataset with places in the *Pleiades* gazetteer.
+**samianresearch-stlpa** implements *STL-PA* (Spatio-Temporal-Lexical Place Alignment), a semi-automatic method for aligning archaeological site references from the *SamianResearch* dataset with places in the *Pleiades* gazetteer.
 
-The tool is designed for research contexts where place references are uncertain, fuzzy, or historically ambiguous. Instead of relying on a single criterion, STL‑PA combines **spatial proximity**, **lexical similarity**, and **temporal overlap** into a transparent, weighted scoring model. The workflow supports evaluation against manually curated links and produces both machine‑readable outputs and human‑readable reports.
+The tool is designed for research contexts where place references are uncertain, fuzzy, or historically ambiguous. Instead of relying on a single criterion, STL-PA combines **spatial proximity**, **lexical similarity**, and **temporal overlap** into a transparent, weighted scoring model. The workflow supports evaluation against manually curated links and produces both machine-readable outputs and human-readable reports.
 
-The primary use case is the reconciliation of Roman‑period Samian Ware production and distribution sites with canonical Pleiades place identifiers, but the approach is generic and reusable.
+The primary use case is the reconciliation of Roman-period Samian Ware production and distribution sites with canonical Pleiades place identifiers, but the approach is generic and reusable.
 
 ---
 
-## Method (STL‑PA)
+## Method (STL-PA)
 
-STL‑PA operates in four main stages, implemented in `stlpa_run.py`:
+The overall STL-PA workflow is illustrated in the following flowchart:
+
+![STL-PA workflow](info/flowchart.png)
+
+STL-PA operates in four main stages, implemented in `stlpa_run.py`:
 
 1. **Normalisation and View Building**  
    Input CSV files are normalised into internal *views*:
@@ -23,7 +27,7 @@ STL‑PA operates in four main stages, implemented in `stlpa_run.py`:
 
 2. **Candidate Generation (Spatial)**  
    For each Samian site, potential Pleiades candidates are selected using a spatial radius around the Samian coordinates.  
-   The radius can be *adaptive*, expanding with increasing temporal uncertainty. A Top‑K fallback ensures candidates are available even in dense regions.
+   The radius can be *adaptive*, expanding with increasing temporal uncertainty. A Top-K fallback ensures candidates are available even in dense regions.
 
 3. **Scoring per Candidate**  
    Each Samian–Pleiades pair is scored along three dimensions:
@@ -60,6 +64,20 @@ These files are combined into a single Pleiades view, including alternative name
 
 ---
 
+## Results
+
+Interactive results from a full STL-PA run are published as static HTML pages:
+
+- **STL-PA Report**  
+  https://research-squirrel-engineers.github.io/samianresearch-stlpa/stlpa_report.html  
+  Compact analytical overview focusing on Top‑1 matches and score contributions.
+
+- **STL-PA Summary**  
+  https://research-squirrel-engineers.github.io/samianresearch-stlpa/stlpa_summary.html  
+  Per-site summaries with ranked candidates and parameter details.
+
+---
+
 ## Output
 
 All results are written to the `out/` directory. Core outputs include:
@@ -68,27 +86,27 @@ All results are written to the `out/` directory. Core outputs include:
   All evaluated Samian–Pleiades candidate pairs with individual score components and final scores.
 
 - `stlpa_top1.csv`  
-  The top‑ranked Pleiades match per Samian site.
+  The top-ranked Pleiades match per Samian site.
 
 - `stlpa_summary.json`  
-  Structured per‑site summaries, including parameters and ranked candidates.
+  Structured per-site summaries, including parameters and ranked candidates.
 
 - `stlpa_summary.html`  
-  Human‑readable rendering of the summary JSON for inspection and review.
+  Human-readable rendering of the summary JSON for inspection and review.
 
 - `stlpa_report.html`  
-  Compact analytical report focusing on Top‑1 results, including contribution plots for geo, string, and time scores.
+  Compact analytical report focusing on Top-1 results, including contribution plots for geo, string, and time scores.
 
 If manual mappings are provided, additional evaluation files (`stlpa_manual_eval.*`) are generated.
 
 ---
 
-## Why STL‑PA?
+## Why STL-PA?
 
-STL‑PA makes the alignment process:
+STL-PA makes the alignment process:
 - **transparent** (explicit scores and weights),
-- **reproducible** (CSV‑based inputs and deterministic scoring),
-- **evaluatable** (manual links integrated as first‑class citizens),
+- **reproducible** (CSV-based inputs and deterministic scoring),
+- **evaluatable** (manual links integrated as first-class citizens),
 - **adaptable** (weights, thresholds, and uncertainty handling are configurable).
 
 This makes it suitable both for exploratory research and for methodologically explicit publications in computational archaeology and digital gazetteer studies.
